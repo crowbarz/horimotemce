@@ -143,6 +143,6 @@ dmypy.json
 .prof
 
 ## local additions
-horimotemce_setup.sh
+/*_setup.sh
 
 # End of https://www.toptal.com/developers/gitignore/api/python
