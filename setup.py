@@ -17,11 +17,10 @@ setuptools.setup(
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
-        "Operating System :: OS Independent",
+        "Operating System :: POSIX :: Linux",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python",
         "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
         "Topic :: Multimedia",
     ],
     keywords="horimote mce",
