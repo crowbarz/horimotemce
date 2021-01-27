@@ -6,13 +6,15 @@ import logging
 import traceback
 import time
 import random
+import argparse
 from threading import Timer
 import horimote
 from .keys import HORIZON_KEY_MAP
 
 APP_NAME = "horimotemce"
+VERSION = "0.1.0"
 _LOGGER = logging.getLogger(APP_NAME)
-_LOG_LEVEL = logging.INFO
+_DEFAULT_LOG_LEVEL = logging.WARN
 
 LIRC_SOCK_PATH = "/var/run/lirc/lircd"
 HORIZON_MEDIA_HOST = "horizon-media"
@@ -36,12 +38,15 @@ class LircDisconnected(Exception):
 
 
 ## https://stackoverflow.com/questions/12248132/how-to-change-tcp-keepalive-timer-using-python-script
-def set_keepalive(sock, after_idle_sec=1, interval_sec=3, max_fails=5):
+def set_tcp_keepalive(sock, after_idle_sec=1, interval_sec=3, max_fails=5):
     """Set TCP keepalive on an open socket.
 
     It activates after 1 second (after_idle_sec) of idleness,
     then sends a keepalive ping once every 3 seconds (interval_sec),
-    and closes the connection after 5 failed ping (max_fails), or 15 seconds
+    and closes the connection after 5 failed ping (max_fails), or 15 seconds.
+
+    NOTE: Closed connection results in the next read/write failing immediately
+          if it is not currently blocking.
     """
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, after_idle_sec)
@@ -52,20 +57,27 @@ def set_keepalive(sock, after_idle_sec=1, interval_sec=3, max_fails=5):
 class HorimoteClient(horimote.Client):
     """Extended Horimote client that supports keepalive."""
 
-    def __init__(self, ip, port=5900):
+    def __init__(self, ip, port=5900, keepalive=False):
         self._keepalive_timer = None
-        super().__init__(ip, port)
+        self._keepalive = keepalive
+
+        ## Replicate constructor but don't connect/authorize yet
+        self.ip = ip
+        self.port = port
+        self.con = None
 
     def connect(self):
         """Start keepalive timer after successfully connecting."""
         super().connect()
-        # self.init_keepalive_timer()
-        set_keepalive(self.con, 15, 1, 5)
+        self.authorize()
+        if self._keepalive:
+            self.init_keepalive_timer()
+        set_tcp_keepalive(self.con, 15, 1, 5)
 
     def disconnect(self):
         """Disconnect and free socket on disconnect."""
         if self._keepalive_timer:
-            _LOGGER.debug("Stopping existing keepalive timer")
+            _LOGGER.debug("stopping existing keepalive timer")
             self._keepalive_timer.cancel()
         super().disconnect()
         del self.con
@@ -79,21 +91,24 @@ class HorimoteClient(horimote.Client):
         """Initialise keepalive."""
         if self._keepalive_timer:
             self._keepalive_timer.cancel()
-            _LOGGER.debug("Stopped existing keepalive timer")
+            _LOGGER.debug("stopped existing keepalive timer")
             del self._keepalive_timer
         self._keepalive_timer = Timer(HORIMOTE_KEEPALIVE_TIME, self.send_keepalive)
         self._keepalive_timer.start()
-        _LOGGER.debug(f"Started keepalive timer for {HORIMOTE_KEEPALIVE_TIME}s")
+        _LOGGER.debug(f"started keepalive timer for {HORIMOTE_KEEPALIVE_TIME}s")
 
     def send_keepalive(self):
         """Send a keepalive packet."""
         self._keepalive_timer = None
         if self.con != None:
             try:
-                _LOGGER.debug(f"Sending keepalive")
+                _LOGGER.debug("sending keepalive")
                 self.con.send(b"")
             except OSError as e:
-                _LOGGER.error(f"Could not send to Horizon: {e}")
+                _LOGGER.error("could not send to Horizon: %s", e)
+                ## TODO: does not work as timer tasks run in a different
+                ##       context. Need to signal main thread, and refactor
+                ##       recv() on LIRC socket to check for signal.
                 raise HorimoteDisconnected
         self.init_keepalive_timer()
 
@@ -101,82 +116,100 @@ class HorimoteClient(horimote.Client):
 class LircClient:
     """Class for lirc socket."""
 
-    ## Save retry event across disconnect/reconnects
-    _retry_event = None
-    _last_event_time = 0
+    _last_event_timestamp = 0
+    _retry_event = None  ## received event to be retried
+    _retry_event_timestamp = 0
 
     def __init__(self, sock_path):
-        ## Connect to socket
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(sock_path)
-        _LOGGER.info(f"Connected to lirc socket {sock_path}")
+        self._sock_path = sock_path
+        self._sock = None
+
+    def connect(self):
+        """Connect to LIRC socket."""
+        if not self._sock:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(self._sock_path)
+            self._sock = sock
+        else:
+            _LOGGER.warning("LIRC socket %s already connected", self._sock_path)
+
+    def disconnect(self):
+        """Disconnect from LIRC socket."""
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+    def send_event(self, horimote_client, event=None):
+        """Send an event to HorimoteClient."""
+        if event is None:
+            ## Process any saved event if event is None
+            if LircClient._retry_event:
+                event = LircClient._retry_event
+                event_timestamp = LircClient._retry_event_timestamp
+                LircClient._retry_event = None
+
+                event_timedelta = round(time.time() - event_timestamp, 3)
+                if event_timedelta >= CACHED_EVENT_EXPIRE_TIME:
+                    _LOGGER.debug(
+                        "ignoring expired event: '%s' (expired: %.3fs ago)",
+                        event,
+                        event_timedelta,
+                    )
+                    return
+                _LOGGER.debug("processing saved event: '%s'", event)
+            else:
+                ## No saved event to process
+                return
+        else:
+            event_timestamp = time.time()
+
+        event_timedelta_ms = (event_timestamp - LircClient._last_event_timestamp) * 1000
+        try:
+            event_info = str(event).split(" ", 4)
+            repeat_flag = event_info[1] != "0"
+            mce_key = event_info[2]
+
+            if repeat_flag and event_timedelta_ms < MIN_REPEAT_TIME_MS:
+                ## Ignore repeated key
+                _LOGGER.debug("ignoring repeated key: %s", mce_key)
+                return
+
+            LircClient._last_event_timestamp = event_timestamp
+            horizon_key = HORIZON_KEY_MAP.get(mce_key)
+            if horizon_key:
+                _LOGGER.info(
+                    "map key: %s to: %s (+%dms)",
+                    mce_key,
+                    str(horizon_key),
+                    round(event_timedelta_ms),
+                )
+                horimote_client.send_key(horizon_key)
+            else:
+                _LOGGER.debug("ignoring unmapped key: %s", mce_key)
+        except OSError as e:
+            _LOGGER.error("could not send to Horizon: %s", e)
+            LircClient._retry_event = event  ## Save event to replay
+            LircClient._retry_event_timestamp = event_timestamp
+            raise HorimoteDisconnected
 
     def event_loop(self, horimote_client):
-        event = None
-        if LircClient._retry_event:
-            ## Handle saved event
-            event = LircClient._retry_event
-            LircClient._retry_event = None
-            event_timedelta = round(time.time() - LircClient._last_event_time, 4)
-            if event_timedelta >= CACHED_EVENT_EXPIRE_TIME:
-                _LOGGER.debug(
-                    f"Ignoring saved event: '{event}' (expired: {event_timedelta}s ago)"
-                )
-                event = None  ## Ignore expired saved event
-            else:
-                _LOGGER.debug(
-                    f"Processing saved event: '{event}' (generated {event_timedelta}s ago)"
-                )
-
-        if not event:
+        """Main event loop."""
+        while True:
+            self.send_event(horimote_client)  ## Process saved event if any
             try:
                 ## Read a key event from the socket
                 event = self._sock.recv(SOCK_BUFSIZE)
-                _LOGGER.debug(f"Receive event: '{event}'")
+                _LOGGER.debug("received LIRC event: '%s'", event)
             except OSError as e:
-                ## socket error, mark disconnected
-                _LOGGER.error(f"Could not read from lirc: {e}")
+                ## Socket error, mark disconnected
+                _LOGGER.error("could not read from LIRC: %s", e)
                 raise LircDisconnected
 
-        if event:
-            ## Map and send to horimote
-            try:
-                event_time = time.time()
-                event_timedelta_ms = (event_time - LircClient._last_event_time) * 1000
-                event_info = str(event).split(" ", 4)
-
-                repeat_flag = event_info[1] != "0"
-                if repeat_flag and event_timedelta_ms < MIN_REPEAT_TIME_MS:
-                    ## Ignore repeated key
-                    return
-
-                LircClient._last_event_time = event_time
-                mce_key = event_info[2]
-                horizon_key = HORIZON_KEY_MAP.get(mce_key)
-                _LOGGER.debug(
-                    f"Map key: {mce_key} to: {str(horizon_key)} (+{round(event_timedelta_ms)}ms)"
-                )
-                if horizon_key:
-                    horimote_client.send_key(horizon_key)
-                else:
-                    _LOGGER.debug(f"Ignoring unmapped key: {mce_key}")
-            except OSError as e:
-                _LOGGER.error(f"Could not send to Horizon: {e}")
-                LircClient._retry_event = bytes(
-                    event
-                )  ## Save event to replay when connected
-                raise HorimoteDisconnected
-        else:
-            ## Socket disconnected
-            _LOGGER.error(f"Empty event received from lirc")
-            raise LircDisconnected
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, type, value, tb):
-        _LOGGER.debug("Disconnected from lirc socket")
-        self._sock.close()
+            if event:
+                self.send_event(horimote_client, event)  ## Map and send to horimote
+            else:
+                _LOGGER.error(f"empty event received from LIRC, disconnecting")
+                raise LircDisconnected
 
 
 def get_backoff_delay(retry_count):
@@ -184,61 +217,76 @@ def get_backoff_delay(retry_count):
     delay = round(
         min(RECONNECT_DELAY_MAX, (2 ** retry_count) - 1)
         + (random.randint(0, 1000) / 1000),
-        4,
+        3,
     )
     return delay
 
 
 def main_loop():
     ## Create horimote client
-    host = HORIZON_MEDIA_HOST
     lirc_sock_path = LIRC_SOCK_PATH
+    lirc_client = LircClient(lirc_sock_path)
+    lirc_connected = False
+    lirc_retry = 0
+
+    horimote_host = HORIZON_MEDIA_HOST
+    horimote_client = HorimoteClient(horimote_host)
+    horimote_connected = False
     horimote_retry = 0
+
     while True:
-        try:
-            _LOGGER.debug(f"Connecting to Horizon host {host}")
-            with HorimoteClient(host) as horimote_client:
-                _LOGGER.info(f"Connected to Horizon host {host}")
-                horimote_retry = 0
+        ## Connect to LIRC
+        if not lirc_connected:
+            try:
+                _LOGGER.debug("connecting to LIRC socket %s", lirc_sock_path)
+                lirc_client.connect()
+                _LOGGER.info("connected to LIRC socket %s", lirc_sock_path)
+                lirc_connected = True
                 lirc_retry = 0
-                while True:
-                    try:
-                        ## Open lirc socket
-                        with LircClient(lirc_sock_path) as lirc_client:
-                            lirc_retry = 0
-                            while True:
-                                ## Process events
-                                lirc_client.event_loop(horimote_client)
-                    except OSError as e:
-                        if lirc_retry == 0:
-                            _LOGGER.error(f"Could not connect to lirc: {e}")
-                        else:
-                            _LOGGER.debug(f"Retry #{lirc_retry} failed: {e}")
-                    except LircDisconnected:
-                        pass
-                    except HorimoteDisconnected:
-                        break
+            except OSError as e:
+                if lirc_retry == 0:
+                    _LOGGER.error("could not connect to LIRC: %s, retrying", e)
+                else:
+                    _LOGGER.debug("LIRC connect retry #%d failed: %s", lirc_retry, e)
+                lirc_delay = get_backoff_delay(horimote_retry)
+                _LOGGER.debug("waiting %ds before retrying LIRC", lirc_delay)
+                time.sleep(lirc_delay)
+                lirc_retry += 1
+                continue
 
-                    ## Reconnect lirc client if horimote still connected
-                    lirc_delay = get_backoff_delay(lirc_retry)
-                    _LOGGER.debug(f"Waiting {lirc_delay}s before retrying lirc")
-                    time.sleep(lirc_delay)
-                    lirc_retry += 1
+        ## Connect to horimote
+        if not horimote_connected:
+            try:
+                _LOGGER.debug("connecting to Horizon host %s", horimote_host)
+                horimote_client.connect()
+                _LOGGER.info("connected to Horizon host %s", horimote_host)
+                horimote_connected = True
+                horimote_retry = 0
+            except OSError as e:
+                if horimote_retry == 0:
+                    _LOGGER.error("could not connect to Horizon: %s, retrying", e)
+                else:
+                    _LOGGER.debug(
+                        "Horizon connect retry #%d failed: %s", horimote_retry, e
+                    )
+                horimote_delay = get_backoff_delay(horimote_retry)
+                _LOGGER.debug("waiting %ds before retrying Horizon", horimote_delay)
+                time.sleep(horimote_delay)
+                horimote_retry += 1
+                continue
 
-        except OSError as e:
-            if horimote_retry == 0:
-                _LOGGER.error(f"Could not connect to Horizon host: {e}")
-            else:
-                _LOGGER.debug(f"Retry #{horimote_retry} failed: {e}")
-        # except Exception as e:
-        #     _LOGGER.error(f'Exception: {e}')
-        #     traceback.print_exc()
-
-        ## Delay reconnection to horimote
-        horimote_delay = get_backoff_delay(horimote_retry)
-        _LOGGER.debug(f"Waiting {horimote_delay}s before retrying Horizon")
-        time.sleep(horimote_delay)
-        horimote_retry += 1
+        try:
+            lirc_client.event_loop(horimote_client)
+        except LircDisconnected:
+            lirc_connected = False
+            lirc_client.disconnect()
+        except HorimoteDisconnected:
+            horimote_connected = False
+            horimote_client.disconnect()
+        except Exception as e:
+            lirc_client.disconnect()
+            horimote_client.disconnect()
+            raise e
 
 
 def sigterm_handler(signal, frame):
@@ -246,14 +294,48 @@ def sigterm_handler(signal, frame):
     raise ExitApp
 
 
+def parse_args():
+    """ Parse command line arguments. """
+    parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS)
+    parser.add_argument(
+        "-k", "--keepalive", help="enable keepalive timer", action="store_true"
+    )
+    parser.add_argument(
+        "-d", "--debug", help="enable console debug logging", action="store_true"
+    )
+    parser.add_argument(
+        "-I", "--info", help="enable console info logging", action="store_true"
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        help="show application version",
+        action="version",
+        version="%(prog)s " + VERSION,
+    )
+    args = vars(parser.parse_args())
+    return args
+
+
 def main():
+    log_level = _DEFAULT_LOG_LEVEL
+    args = parse_args()
+    log_level_name = "(none)"
+    if args.get("debug"):
+        log_level = logging.DEBUG
+        log_level_name = "debug"
+    elif args.get("info"):
+        log_level = logging.INFO
+        log_level_name = "info"
     try:
         ## Catch SIGTERM and enable logging
         logging.basicConfig(
-            level=_LOG_LEVEL,
+            level=log_level,
             format="%(asctime)s %(levelname)s[%(threadName)s]: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
+        _LOGGER.setLevel(log_level)
+        _LOGGER.info("setting log level to %s", log_level_name)
         signal.signal(signal.SIGTERM, sigterm_handler)
 
         ## Start main loop
