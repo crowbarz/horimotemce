@@ -4,12 +4,27 @@
 
 Listen for MCE remote button presses detected by [InputLIRC](https://packages.debian.org/buster/inputlirc) and send them to [horimote](https://github.com/benleb/horimote).
 
-It is used to detect IR keypresses generated from a Windows MCE compatible remote (or a suitably configured Logitech Harmony Hub) and send them to a Samsung SMT-G7400/G7401 box, commonly branded as the Virgin Media/upc/Unitymedia Horizon box used by several European cable operators. This allows commands that cannot be sent via IR (eg. DVD, Guide button) to be emulated via the SMT-G7400/G7401 IP interface.
+It is used to detect IR keypresses generated from a Windows MCE compatible remote (or a suitably configured Logitech Harmony Hub) and send them to a Samsung SMT-G7400/G7401 box, commonly branded as the Virgin Media/upc/Unitymedia Horizon box used by several European cable operators. This allows commands that cannot be sent via IR (eg. DVD and Guide buttons) to be emulated via the SMT-G7400/G7401 IP interface.
 
 ## Installation
 
-This script should run on most Linux installations (including Raspbian/Rasperry Pi OS) and requires the following:
+This package should run on most Linux installations (including Raspbian/Rasperry Pi OS) and requires the following:
 
 - an MCE IR receiver that is supported by inputlirc.
-- `inputlirc` package installed on the underlying operating system
-- `horimote` package installed via `pip`
+- `inputlirc` package installed and configured on the underlying operating system to read and process input from the MCE IR receiver
+
+Install the module via PyPi:
+```yaml
+pip install horimotemce
+```
+
+Run the daemon using `horimotemce`.
+
+## Options
+
+| **Option** | **Default** | **Description**
+| -- | -- | --
+| <nobr>`--keepalive`</nobr> | off | Enables keepalives to be sent every 15 seconds. **Not currently implemented, see source**
+| <nobr>`--debug`, `--info`</nobr> | off | Enables debug/info level logging respectively
+| <nobr>`--version`</nobr> | | Show currently installed version
+
