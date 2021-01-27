@@ -12,7 +12,7 @@ import horimote
 from .keys import HORIZON_KEY_MAP
 
 APP_NAME = "horimotemce"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 _LOGGER = logging.getLogger(APP_NAME)
 _DEFAULT_LOG_LEVEL = logging.WARN
 
