@@ -22,7 +22,6 @@ SOCK_BUFSIZE = 4096
 RECONNECT_DELAY_MAX = 64
 MIN_REPEAT_TIME_MS = 740
 CACHED_EVENT_EXPIRE_TIME = 5
-HORIMOTE_KEEPALIVE_TIME = 15.0
 
 
 class ExitApp(Exception):
@@ -55,12 +54,9 @@ def set_tcp_keepalive(sock, after_idle_sec=1, interval_sec=3, max_fails=5):
 
 
 class HorimoteClient(horimote.Client):
-    """Extended Horimote client that supports keepalive."""
+    """Horimote client that does not connect/authorize until connect() called."""
 
     def __init__(self, ip, port=5900, keepalive=False):
-        self._keepalive_timer = None
-        self._keepalive = keepalive
-
         ## Replicate constructor but don't connect/authorize yet
         self.ip = ip
         self.port = port
@@ -70,47 +66,12 @@ class HorimoteClient(horimote.Client):
         """Start keepalive timer after successfully connecting."""
         super().connect()
         self.authorize()
-        if self._keepalive:
-            self.init_keepalive_timer()
         set_tcp_keepalive(self.con, 15, 1, 5)
 
     def disconnect(self):
         """Disconnect and free socket on disconnect."""
-        if self._keepalive_timer:
-            _LOGGER.debug("stopping existing keepalive timer")
-            self._keepalive_timer.cancel()
         super().disconnect()
         del self.con
-
-    def send_key(self, key):
-        """Start keepalive timer after sending a key."""
-        super().send_key(key)
-        # self.init_keepalive_timer()
-
-    def init_keepalive_timer(self):
-        """Initialise keepalive."""
-        if self._keepalive_timer:
-            self._keepalive_timer.cancel()
-            _LOGGER.debug("stopped existing keepalive timer")
-            del self._keepalive_timer
-        self._keepalive_timer = Timer(HORIMOTE_KEEPALIVE_TIME, self.send_keepalive)
-        self._keepalive_timer.start()
-        _LOGGER.debug(f"started keepalive timer for {HORIMOTE_KEEPALIVE_TIME}s")
-
-    def send_keepalive(self):
-        """Send a keepalive packet."""
-        self._keepalive_timer = None
-        if self.con != None:
-            try:
-                _LOGGER.debug("sending keepalive")
-                self.con.send(b"")
-            except OSError as e:
-                _LOGGER.error("could not send to Horizon: %s", e)
-                ## TODO: does not work as timer tasks run in a different
-                ##       context. Need to signal main thread, and refactor
-                ##       recv() on LIRC socket to check for signal.
-                raise HorimoteDisconnected
-        self.init_keepalive_timer()
 
 
 class LircClient:
@@ -139,6 +100,19 @@ class LircClient:
             self._sock.close()
             self._sock = None
 
+    def flush_lirc(self):
+        """Flush all requests from LIRC socket."""
+        sock = self._sock
+        sock.setblocking(False)
+        try:
+            while True:
+                sock.recv(SOCK_BUFSIZE)
+        except:
+            pass
+        sock.setblocking(True)
+        LircClient._retry_event = None
+        _LOGGER.debug("flushed LIRC socket")
+
     def send_event(self, horimote_client, event=None):
         """Send an event to HorimoteClient."""
         if event is None:
@@ -151,10 +125,11 @@ class LircClient:
                 event_timedelta = round(time.time() - event_timestamp, 3)
                 if event_timedelta >= CACHED_EVENT_EXPIRE_TIME:
                     _LOGGER.debug(
-                        "ignoring expired event: '%s' (expired: %.3fs ago)",
+                        "ignoring expired event: '%s' (%.3fs ago)",
                         event,
                         event_timedelta,
                     )
+                    self.flush_lirc()
                     return
                 _LOGGER.debug("processing saved event: '%s'", event)
             else:
@@ -226,12 +201,12 @@ def main_loop():
     ## Create horimote client
     lirc_sock_path = LIRC_SOCK_PATH
     lirc_client = LircClient(lirc_sock_path)
-    lirc_connected = False
+    lirc_connected = None
     lirc_retry = 0
 
     horimote_host = HORIZON_MEDIA_HOST
     horimote_client = HorimoteClient(horimote_host)
-    horimote_connected = False
+    horimote_connected = None
     horimote_retry = 0
 
     while True:
@@ -248,7 +223,7 @@ def main_loop():
                     _LOGGER.error("could not connect to LIRC: %s, retrying", e)
                 else:
                     _LOGGER.debug("LIRC connect retry #%d failed: %s", lirc_retry, e)
-                lirc_delay = get_backoff_delay(horimote_retry)
+                lirc_delay = get_backoff_delay(lirc_retry)
                 _LOGGER.debug("waiting %ds before retrying LIRC", lirc_delay)
                 time.sleep(lirc_delay)
                 lirc_retry += 1
@@ -260,6 +235,8 @@ def main_loop():
                 _LOGGER.debug("connecting to Horizon host %s", horimote_host)
                 horimote_client.connect()
                 _LOGGER.info("connected to Horizon host %s", horimote_host)
+                if horimote_connected is None:
+                    lirc_client.flush_lirc()  ## Flush on initial connection
                 horimote_connected = True
                 horimote_retry = 0
             except OSError as e:
@@ -298,16 +275,13 @@ def parse_args():
     """ Parse command line arguments. """
     parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS)
     parser.add_argument(
-        "-k", "--keepalive", help="enable keepalive timer", action="store_true"
-    )
-    parser.add_argument(
-        "-d", "--debug", help="enable console debug logging", action="store_true"
-    )
-    parser.add_argument(
-        "-I", "--info", help="enable console info logging", action="store_true"
-    )
-    parser.add_argument(
         "-v",
+        "--verbose",
+        help="set logging verbosity, repeat to increase",
+        action="count",
+    )
+    parser.add_argument(
+        "-V",
         "--version",
         help="show application version",
         action="version",
@@ -320,11 +294,12 @@ def parse_args():
 def main():
     log_level = _DEFAULT_LOG_LEVEL
     args = parse_args()
+    log_level_count = args.get("verbose", 0)
     log_level_name = "(none)"
-    if args.get("debug"):
+    if log_level_count >= 2:
         log_level = logging.DEBUG
         log_level_name = "debug"
-    elif args.get("info"):
+    elif log_level_count >= 1:
         log_level = logging.INFO
         log_level_name = "info"
     try:

@@ -24,7 +24,6 @@ Run the daemon using `horimotemce`.
 
 | **Option** | **Default** | **Description**
 | -- | -- | --
-| <nobr>`--keepalive`</nobr> | off | Enables keepalives to be sent every 15 seconds. **Not currently implemented, see source**
-| <nobr>`--debug`, `--info`</nobr> | off | Enables debug/info level logging respectively
-| <nobr>`--version`</nobr> | | Show currently installed version
+| <nobr>`-v` \| `--verbose`</nobr> | none | Set logging verbosity (repeat to increase)
+| <nobr>`-V` \| `--version`</nobr> | | Show currently installed version
 
